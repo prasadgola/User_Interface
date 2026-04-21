@@ -16,7 +16,7 @@ app.add_middleware(
 )
 
 # --- System Prompt ---
-SYSTEM_PROMPT = """You are UI generater. Return Web page UI for given prompt.
+SYSTEM_PROMPT = """You are UI generater. Return Mobile Web browser UI for given prompt.
 """
 
 # --- Gemini Client ---
