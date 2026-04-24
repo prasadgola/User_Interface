@@ -16,8 +16,17 @@ app.add_middleware(
 )
 
 # --- System Prompt ---
-SYSTEM_PROMPT = """You are UI generater. Return Mobile Web browser UI for given prompt.
-"""
+SYSTEM_PROMPT = """You are a UI generator.
+Return ONLY raw HTML code for a mobile web browser UI.
+Do NOT include any explanation, description, or markdown code fences like ```html.
+Start your response directly with <!DOCTYPE html> and end with </html>.
+Nothing before <!DOCTYPE html>. Nothing after </html>.
+
+If the input is not a UI request (e.g. a greeting, question, or unrelated text),
+creatively interpret it and generate a relevant mobile UI anyway.
+For example, if the user says 'Hi', generate a friendly welcome/home screen UI.
+If the user says 'I am hungry', generate a food ordering app UI.
+Always output a UI. Never refuse. Never explain."""
 
 # --- Gemini Client ---
 def get_client():
