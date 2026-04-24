@@ -67,7 +67,7 @@ async def chat(request: ChatRequest):
 
     response = await asyncio.to_thread(
         client.models.generate_content,
-        model="gemini-3-flash-preview",
+        model="gemini-3.1-flash-live-preview",
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
