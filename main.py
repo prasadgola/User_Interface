@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,7 +18,7 @@ app.add_middleware(
 )
 
 # --- System Prompt ---
-SYSTEM_PROMPT = """You are a UI generator.
+UI_SYSTEM_PROMPT = """You are a UI generator.
 Return ONLY raw HTML code for a mobile web browser UI.
 Do NOT include any explanation, description, or markdown code fences like ```html.
 Start your response directly with <!DOCTYPE html> and end with </html>.
@@ -42,12 +43,11 @@ class ChatRequest(BaseModel):
     message: str
     history: list[dict] = []
 
-
 class ChatResponse(BaseModel):
     response: str
 
 
-# --- /chat Endpoint (text, fixed model) ---
+# --- /chat Endpoint (text → HTML) ---
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     client = get_client()
@@ -72,7 +72,7 @@ async def chat(request: ChatRequest):
         model="gemini-3-flash-preview",
         contents=contents,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=UI_SYSTEM_PROMPT,
             temperature=0.7,
             max_output_tokens=8192,
         ),
@@ -92,16 +92,21 @@ async def chat(request: ChatRequest):
     return ChatResponse(response=text)
 
 
-# --- /live WebSocket Endpoint (Gemini 2.0 Flash Live) ---
+# --- /live WebSocket Endpoint (text in, text out) ---
 @app.websocket("/live")
 async def live(websocket: WebSocket):
+    """
+    Text-based live WebSocket.
+    Client sends: {"text": "..."}
+    Server sends: {"type": "text", "content": "..."} and {"type": "done"}
+    """
     await websocket.accept()
     client = get_client()
 
     config = types.LiveConnectConfig(
         response_modalities=["TEXT"],
         system_instruction=types.Content(
-            parts=[types.Part.from_text(text=SYSTEM_PROMPT)]
+            parts=[types.Part.from_text(text=UI_SYSTEM_PROMPT)]
         ),
     )
 
@@ -110,6 +115,7 @@ async def live(websocket: WebSocket):
             model="gemini-3.1-flash-live-preview",
             config=config,
         ) as session:
+
             async def receive_from_client():
                 try:
                     while True:
@@ -141,9 +147,7 @@ async def live(websocket: WebSocket):
                                 json.dumps({"type": "text", "content": response.text})
                             )
                         if response.server_content and response.server_content.turn_complete:
-                            await websocket.send_text(
-                                json.dumps({"type": "done"})
-                            )
+                            await websocket.send_text(json.dumps({"type": "done"}))
                 except WebSocketDisconnect:
                     pass
 
@@ -156,6 +160,158 @@ async def live(websocket: WebSocket):
             await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
         except:
             pass
+
+
+# --- /voice WebSocket Endpoint (audio in, audio out + UI HTML at end) ---
+@app.websocket("/voice")
+async def voice(websocket: WebSocket):
+    """
+    Voice + camera WebSocket. Same pattern as digital twin /voice.
+
+    Client sends:
+      - binary bytes  → raw PCM audio (16kHz, mono, 16-bit)
+      - {"type": "image", "data": "<base64 JPEG>"}  → camera frame
+      - {"type": "end"}   → user done speaking, trigger UI generation
+      - {"type": "close"} → close session
+
+    Server sends:
+      - binary bytes                              → PCM audio response (24kHz)
+      - {"type": "transcript", "text": "..."}    → Gemini speech transcript
+      - {"type": "turn_complete"}                 → Gemini finished speaking
+      - {"type": "ui", "content": "<html>..."}   → final UI HTML when user ends
+    """
+    await websocket.accept()
+    client = get_client()
+
+    # Accumulate transcript to generate UI at the end
+    transcript_parts = []
+
+    try:
+        config = types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            system_instruction=types.Content(
+                parts=[types.Part.from_text(text=UI_SYSTEM_PROMPT)]
+            ),
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Fenrir"
+                    )
+                )
+            ),
+        )
+
+        async with client.aio.live.connect(
+            model="gemini-3.1-flash-live-preview",
+            config=config,
+        ) as session:
+
+            async def receive_and_forward():
+                nonlocal transcript_parts
+                try:
+                    while True:
+                        data = await websocket.receive()
+
+                        if "bytes" in data:
+                            # Raw PCM audio from mic
+                            await session.send(
+                                input=types.LiveClientRealtimeInput(
+                                    media_chunks=[
+                                        types.Blob(
+                                            data=data["bytes"],
+                                            mime_type="audio/pcm;rate=16000",
+                                        )
+                                    ]
+                                )
+                            )
+
+                        elif "text" in data:
+                            msg = json.loads(data["text"])
+
+                            if msg.get("type") == "image":
+                                # Camera frame — send as inline image
+                                image_bytes = base64.b64decode(msg["data"])
+                                await session.send(
+                                    input=types.LiveClientRealtimeInput(
+                                        media_chunks=[
+                                            types.Blob(
+                                                data=image_bytes,
+                                                mime_type="image/jpeg",
+                                            )
+                                        ]
+                                    )
+                                )
+
+                            elif msg.get("type") == "end":
+                                # User finished speaking — generate UI from transcript
+                                combined = " ".join(transcript_parts).strip()
+                                if combined:
+                                    ui_html = await generate_ui(client, combined)
+                                    await websocket.send_text(
+                                        json.dumps({"type": "ui", "content": ui_html})
+                                    )
+
+                            elif msg.get("type") == "close":
+                                await session.close()
+                                return
+
+                except WebSocketDisconnect:
+                    pass
+
+            async def receive_and_send_response():
+                try:
+                    async for response in session.receive():
+                        # Audio response → send as binary
+                        if response.data:
+                            await websocket.send_bytes(response.data)
+
+                        # Transcript → collect + forward
+                        if response.text:
+                            transcript_parts.append(response.text)
+                            await websocket.send_text(
+                                json.dumps({"type": "transcript", "text": response.text})
+                            )
+
+                        if response.server_content and response.server_content.turn_complete:
+                            await websocket.send_text(json.dumps({"type": "turn_complete"}))
+
+                except Exception as e:
+                    print(f"Error receiving from Gemini: {e}")
+
+            await asyncio.gather(receive_and_forward(), receive_and_send_response())
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "content": str(e)}))
+        except:
+            pass
+
+
+async def generate_ui(client, transcript: str) -> str:
+    """Take the conversation transcript and generate a UI HTML page."""
+    prompt = f"Based on this conversation: '{transcript}' — generate a relevant mobile UI."
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model="gemini-3-flash-preview",
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
+        config=types.GenerateContentConfig(
+            system_instruction=UI_SYSTEM_PROMPT,
+            temperature=0.7,
+            max_output_tokens=8192,
+        ),
+    )
+    text = response.text.strip()
+    start = text.lower().find("<!doctype")
+    if start == -1:
+        start = text.lower().find("<html")
+    if start != -1:
+        text = text[start:]
+    end = text.lower().rfind("</html>")
+    if end != -1:
+        text = text[:end + 7]
+    return text
 
 
 # --- Health Check ---
